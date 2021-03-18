@@ -1,5 +1,7 @@
 import pandas as pd
 import locale
+import glob
+import os
 
 _Replace = [('февр', 'фев'), ('нояб', 'ноя'), ('мая', 'май'), ('сент', 'сен'), ]
 MonthReplace = (_Replace + [(s.capitalize(), r) for (s, r) in _Replace])  # для автозамены + capitalize
@@ -9,7 +11,7 @@ def read_one_file(file_name):
     lc_time = locale.getlocale(locale.LC_TIME)
 
     ret = dict()
-    df = pd.read_csv(file_name, sep=',')
+    df = pd.read_csv(file_name, sep=',', error_bad_lines=False)
     # Columns:
     #   'GPS Time' = Wed Feb 03 16:07:43 GMT+03:00 2021
     #   ' Device Time' = 03-февр.-2021 16:09:33.588
@@ -101,11 +103,16 @@ def read_one_file(file_name):
     # delete doubled headers
     df = df[df['GPS Time'] != 'GPS Time']
 
+    # иногда PyCharm не показывает содержимое dataframe в виде таблицы из-за наличия в ней % - заменим их на #
+    # df.columns = df.columns.str.replace('%', '#')
 
-    # 'GPS Time' = Wed Feb 03 16:07:43 GMT+03:00 2021
-    locale.setlocale(locale.LC_TIME, 'en_US')
-    df['GPS Time'] = pd.to_datetime(df['GPS Time'], utc=False, errors='coerce', exact=False)
+    # парсинг времени GPS
+    if 0:
+        # 'GPS Time' = Wed Feb 03 16:07:43 GMT+03:00 2021
+        locale.setlocale(locale.LC_TIME, 'en-US')
+        df['GPS Time'] = pd.to_datetime(df['GPS Time'], utc=False, errors='coerce', exact=False)
 
+    # парсинг времени устройства
     if 0:
         # ' Device Time' = 03-февр.-2021 16:09:33.588
 
@@ -113,27 +120,182 @@ def read_one_file(file_name):
             df[' Device Time'] = df[' Device Time'].str.replace(s, r, 1)
 
         format = '%d-%b.-%Y %H:%M:%S.%f' # '03-фев.-2021 15:46:41.204'
-        locale.setlocale(locale.LC_TIME, 'ru_RU')
+        locale.setlocale(locale.LC_TIME, 'ru-RU')
         df[' Device Time'] = pd.to_datetime(df[' Device Time'], format=format, errors='coerce', exact=False)
 
     locale.setlocale(locale.LC_TIME, lc_time)
 
-    col_name = ' Device Time'
-    v = df[df[col_name] != '-'][col_name].median()
+    # конвертируем в числа все столбцы, кроме первых двух - это время
+    for col_name in list(df.loc[:, (df.columns != ' Device Time') & (df.columns != 'GPS Time')]):
+        df[col_name] = pd.to_numeric(df[col_name], errors='coerce')
 
-    col_name = 'Voltage (Control Module)(V)'
-    # finish_time = df[df[col_name] != '-'][col_name][-1]
-    '''
-    Время начала, конца поездки
-    Продолжительность
-    Расстояние
-    Средний расход
-    Средняя скорость
-    Процентное соотношение режимов движения пробка+город+трасса=100%
-    Напряжение АКБ до запуска (не всегда будет)
-    Напряжение генератора (медианное)
-    Температура окружающей среды
-    '''
+    f = {'engine_start_temperature': 'Engine start temperature, degC'}
+
+    # имена переменных, которые рассчитываются и возвращаются
+    ret_var_names = {
+        'engine_start_time': 'Engine start time',
+        'engine_start_temperature': 'Engine start temperature, °C',
+        'engine_stop_temperature': 'Engine stop temperature, °C',
+        'warming_fuel_used': 'Engine warming fuel, l',
+        'warming_duration': 'Engine warming duration, sec',
+        'warming_finish_engine_temperature': 'Engine warming end temperature, °C',
+        'trip_start_time': 'Trip start time',
+        'trip_finish_time': 'Trip finish time',
+        'trip_start_location_lat': 'Trip start location latitude, °',
+        'trip_start_location_long': 'Trip start location longitude, °',
+        'trip_start_location_alt': 'Trip start location altitude, m',
+        'trip_finish_location_lat': 'Trip finish location latitude, °',
+        'trip_finish_location_long': 'Trip finish location longitude, °',
+        'trip_finish_location_alt': 'Trip finish location altitude, m',
+        'trip_start_ambient_temperature': 'Trip start ambient temperature, °C',
+        'trip_finish_ambient_temperature': 'Trip finish ambient temperature, °C',
+        'trip_distance': 'Trip distance, km',
+        'trip_duration': 'Trip duration, sec',
+        'trip_percentage_idle_driving': 'Trip idle driving, %',
+        'trip_fuel_consumption': 'Trip fuel consumption, l/100km',
+        'trip_fuel_used': 'Trip fuel used, l',
+        'trip_average_speed': 'Trip average speed, km/h',
+        'trip_start_fuel_level': 'Trip start fuel level, l',
+        'trip_finish_fuel_level': 'Trip finish fuel level, l',
+        'fuel_capacity': 'Fuel tank capacity, l',
+        'voltage_alternator': "Alternator's mean voltage, V"
+    }
+
+    # начальные значения возвращаемых переменных
+    for var_name, description in ret_var_names.items():
+        locals()[var_name] = 'none'
+
+    # данные, касающиеся работы двигателя (вне зависимости от поездки)
+    if 1:
+        df_engine_start = df[df['Engine RPM(rpm)'] > 0]
+
+        try:
+            engine_start_time = df_engine_start[' Device Time'].iloc[0]
+        except KeyError:
+            pass
+
+        try:
+            engine_start_temperature = df_engine_start['Engine Coolant Temperature(°C)'].iloc[0]
+            engine_stop_temperature = df_engine_start['Engine Coolant Temperature(°C)'].iloc[-1]
+        except KeyError:
+            pass
+
+        try:
+            voltage_alternator = df_engine_start['Voltage (Control Module)(V)'].median()
+        except KeyError:
+            pass
+
+        del df_engine_start
+
+    # данные в самом начале поездки
+    if 1:
+        row_when_trip_start = df[df['Trip Time(Since journey start)(s)'] > 0].iloc[0]
+        try:
+            trip_start_time = row_when_trip_start[' Device Time']
+        except KeyError:
+            pass
+
+        try:
+            trip_start_location_lat = row_when_trip_start[' Latitude']
+            trip_start_location_long = row_when_trip_start[' Longitude']
+            trip_start_location_alt = row_when_trip_start[' Altitude']
+        except KeyError:
+            pass
+
+        try:
+            trip_start_fuel_level = row_when_trip_start['Fuel Level (From Engine ECU)(%)']
+        except KeyError:
+            pass
+
+        try:
+            trip_start_ambient_temperature = row_when_trip_start['Ambient air temp(°C)']
+        except KeyError:
+            pass
+
+        try:
+            warming_fuel_used = row_when_trip_start['Fuel used (trip)(l)']
+        except KeyError:
+            pass
+
+        try:
+            warming_duration = row_when_trip_start['Run time since engine start(s)']
+        except KeyError:
+            pass
+
+        try:
+            warming_finish_engine_temperature = row_when_trip_start['Engine Coolant Temperature(°C)']
+        except KeyError:
+            pass
+
+    # данные в конце поездки
+    if 1:
+        row_when_trip_finish = df[df['Speed (OBD)(km/h)'] > 0].iloc[-1]
+
+        try:
+            trip_finish_time = row_when_trip_finish[' Device Time']
+        except KeyError:
+            pass
+
+        try:
+            # trip_finish_pos = (row_when_trip_finish[' Latitude'], row_when_trip_finish[' Longitude'], row_when_trip_finish[' Altitude'])
+            trip_finish_location_lat = row_when_trip_finish[' Latitude']
+            trip_finish_location_long = row_when_trip_finish[' Longitude']
+            trip_finish_location_alt = row_when_trip_finish[' Altitude']
+        except KeyError:
+            pass
+
+        try:
+            trip_distance = (row_when_trip_finish['Trip Distance(km)'])
+        except KeyError:
+            pass
+
+        try:
+            trip_duration = (row_when_trip_finish['Trip Time(Since journey start)(s)'])
+        except KeyError:
+            pass
+
+        try:
+            trip_percentage_idle_driving = (row_when_trip_finish['Percentage of Idle driving(%)'])
+        except KeyError:
+            pass
+
+        try:
+            trip_fuel_consumption = (row_when_trip_finish['Trip average Litres/100 KM(l/100km)'])
+        except KeyError:
+            pass
+
+        try:
+            trip_fuel_used = (row_when_trip_finish['Fuel used (trip)(l)'])
+        except KeyError:
+            pass
+
+        try:
+            trip_average_speed = (row_when_trip_finish['Average trip speed(whilst stopped or moving)(km/h)'])
+        except KeyError:
+            pass
+
+        try:
+            trip_finish_fuel_level = (row_when_trip_finish['Fuel Level (From Engine ECU)(%)'])
+        except KeyError:
+            pass
+
+        try:
+            trip_finish_ambient_temperature = (row_when_trip_finish['Ambient air temp(°C)'])
+        except KeyError:
+            pass
+
+        try:
+            pass
+            # fuel_capacity = 100*trip_fuel_used/(trip_start_fuel_level - trip_finish_fuel_level)
+        except KeyError:
+            pass
+        except Exception:
+            pass
+
+    # упакуем значения возвращаемых переменных
+    for var_name, description in ret_var_names.items():
+        ret[description] = locals()[var_name]
+
     return ret
 
 
@@ -151,11 +313,20 @@ if __name__ == '__main__':
             date_str = date_str.replace(s, r, 1)  # 'правильные' имена месяцев
 
     loc = locale.getlocale(locale.LC_TIME)
-    locale.setlocale(locale.LC_TIME, 'ru_RU')
+    locale.setlocale(locale.LC_TIME, "ru-RU")
     out = pd.to_datetime(date_str, format=date_format, errors='coerce', exact=False)
     locale.setlocale(locale.LC_TIME, loc)
     print(out)
 
-    file_name = r'C:\Users\AcerSTE\PycharmProjects\TorqueLogReader\torqueLogs\trackLog-2021-февр.-03_15-46-40.csv'
-    file_summary = read_one_file(file_name)
-    print(file_summary)
+    files_template = r'C:\Users\likhobabin.OPTEN\Downloads\torqueLogs-20210315T123425Z-001\torqueLogs\*.csv'
+    for num, file_path in enumerate(glob.glob(files_template)):
+        file_name = os.path.split(file_path)[1]
+
+        try:
+            file_summary = read_one_file(file_path)
+        except:
+            pass
+        else:
+            if num == 0:
+                print('\t'.join(list(file_summary.keys())))
+            print('\t'.join(map(str, list(file_summary.values()))))
