@@ -2,6 +2,7 @@ import pandas as pd
 import locale
 import glob
 import os
+from inspect import currentframe, getframeinfo
 
 _Replace = [('февр', 'фев'), ('нояб', 'ноя'), ('мая', 'май'), ('сент', 'сен'), ]
 MonthReplace = (_Replace + [(s.capitalize(), r) for (s, r) in _Replace])  # для автозамены + capitalize
@@ -11,7 +12,7 @@ def read_one_file(file_name):
     lc_time = locale.getlocale(locale.LC_TIME)
 
     ret = dict()
-    df = pd.read_csv(file_name, sep=',', error_bad_lines=False)
+    df = pd.read_csv(file_name, sep=',', error_bad_lines=False, low_memory=False)
     # Columns:
     #   'GPS Time' = Wed Feb 03 16:07:43 GMT+03:00 2021
     #   ' Device Time' = 03-февр.-2021 16:09:33.588
@@ -100,8 +101,19 @@ def read_one_file(file_name):
         for col in df.columns:
             print(f"#   '{col}' = {df[col][1000]}")
 
+    shape = df.shape
+    if shape[0] < 100 or shape[1] < 30:
+        raise EOFError('Too small file')
+
     # delete doubled headers
     df = df[df['GPS Time'] != 'GPS Time']
+
+    # first and last rows might be wrong
+    df = df.iloc[1:-2]
+
+    # check if df too small
+    if df.empty:
+        raise EOFError('Too small file')
 
     # иногда PyCharm не показывает содержимое dataframe в виде таблицы из-за наличия в ней % - заменим их на #
     # df.columns = df.columns.str.replace('%', '#')
@@ -129,13 +141,13 @@ def read_one_file(file_name):
     for col_name in list(df.loc[:, (df.columns != ' Device Time') & (df.columns != 'GPS Time')]):
         df[col_name] = pd.to_numeric(df[col_name], errors='coerce')
 
-    f = {'engine_start_temperature': 'Engine start temperature, degC'}
-
     # имена переменных, которые рассчитываются и возвращаются
     ret_var_names = {
         'engine_start_time': 'Engine start time',
         'engine_start_temperature': 'Engine start temperature, °C',
         'engine_stop_temperature': 'Engine stop temperature, °C',
+        'engine_mean_temperature': 'Engine mean temperature, °C',
+        'engine_max_temperature': 'Engine max temperature, °C',
         'warming_fuel_used': 'Engine warming fuel, l',
         'warming_duration': 'Engine warming duration, sec',
         'warming_finish_engine_temperature': 'Engine warming end temperature, °C',
@@ -151,19 +163,53 @@ def read_one_file(file_name):
         'trip_finish_ambient_temperature': 'Trip finish ambient temperature, °C',
         'trip_distance': 'Trip distance, km',
         'trip_duration': 'Trip duration, sec',
+        'trip_percentage_highway_driving': 'Trip highway driving, %',
+        'trip_percentage_city_driving': 'Trip city driving, %',
         'trip_percentage_idle_driving': 'Trip idle driving, %',
         'trip_fuel_consumption': 'Trip fuel consumption, l/100km',
         'trip_fuel_used': 'Trip fuel used, l',
         'trip_average_speed': 'Trip average speed, km/h',
-        'trip_start_fuel_level': 'Trip start fuel level, l',
-        'trip_finish_fuel_level': 'Trip finish fuel level, l',
+        'trip_start_fuel_level': 'Trip start fuel level, %',
+        'trip_finish_fuel_level': 'Trip finish fuel level, %',
         'fuel_capacity': 'Fuel tank capacity, l',
         'voltage_alternator': "Alternator's mean voltage, V"
     }
 
     # начальные значения возвращаемых переменных
+    '''
     for var_name, description in ret_var_names.items():
         locals()[var_name] = 'none'
+    '''
+    engine_start_time = 'none'
+    engine_start_temperature = 'none'
+    engine_stop_temperature = 'none'
+    engine_mean_temperature = 'none'
+    engine_max_temperature = 'none'
+    warming_fuel_used = 'none'
+    warming_duration = 'none'
+    warming_finish_engine_temperature = 'none'
+    trip_start_time = 'none'
+    trip_finish_time = 'none'
+    trip_start_location_lat = 'none'
+    trip_start_location_long = 'none'
+    trip_start_location_alt = 'none'
+    trip_finish_location_lat = 'none'
+    trip_finish_location_long = 'none'
+    trip_finish_location_alt = 'none'
+    trip_start_ambient_temperature = 'none'
+    trip_finish_ambient_temperature = 'none'
+    trip_distance = 'none'
+    trip_duration = 'none'
+    trip_percentage_highway_driving = 'none'
+    trip_percentage_city_driving = 'none'
+    trip_percentage_idle_driving = 'none'
+    trip_fuel_consumption = 'none'
+    trip_fuel_used = 'none'
+    trip_average_speed = 'none'
+    trip_start_fuel_level = 'none'
+    trip_finish_fuel_level = 'none'
+    fuel_capacity = 'none'
+    voltage_alternator = 'none'
 
     # данные, касающиеся работы двигателя (вне зависимости от поездки)
     if 1:
@@ -175,126 +221,164 @@ def read_one_file(file_name):
             pass
 
         try:
-            engine_start_temperature = df_engine_start['Engine Coolant Temperature(°C)'].iloc[0]
-            engine_stop_temperature = df_engine_start['Engine Coolant Temperature(°C)'].iloc[-1]
+            engine_temperatures = df_engine_start[df_engine_start['Engine Coolant Temperature(°C)'].notnull()]['Engine Coolant Temperature(°C)']
+            engine_start_temperature = engine_temperatures.iloc[0]
+            engine_stop_temperature = engine_temperatures.iloc[-1]
+            engine_mean_temperature = engine_temperatures.median()
+            engine_max_temperature = engine_temperatures.max()
         except KeyError:
             pass
 
         try:
-            voltage_alternator = df_engine_start['Voltage (Control Module)(V)'].median()
+            voltage_alternator = df_engine_start['Voltage (Control Module)(V)'].median(skipna=True)
         except KeyError:
             pass
 
         del df_engine_start
 
-    # данные в самом начале поездки
-    if 1:
-        row_when_trip_start = df[df['Trip Time(Since journey start)(s)'] > 0].iloc[0]
+    # поездка определяется появлением и окончанием скорости
+    trip_idx = df.query('`Speed (OBD)(km/h)` > 0 and `Trip Time(Since journey start)(s)` > 0').index
+    trip_start_idx = trip_idx[0]
+    trip_finish_idx = trip_idx[-1]
+    df_trip = df.iloc[trip_start_idx:trip_finish_idx]
+
+    idx = df.query('`Engine RPM(rpm)` > 0').index
+    df_warming = df.iloc[idx[0]:trip_start_idx]
+
+    # row_when_trip_finish = df[df['Speed (OBD)(km/h)'] > 0].iloc[-1]
+    # row_when_trip_start = df[df['Trip Time(Since journey start)(s)'] > 0].iloc[0]
+
+    # прогрев был?
+    if not df_warming.empty:
         try:
-            trip_start_time = row_when_trip_start[' Device Time']
+            # warming_fuel_used = row_when_trip_start['Fuel used (trip)(l)']
+            col = 'Fuel used (trip)(l)'
+            warming_fuel_used = df_warming[df_warming[col].notnull()][col].iloc[-1]
         except KeyError:
             pass
 
         try:
-            trip_start_location_lat = row_when_trip_start[' Latitude']
-            trip_start_location_long = row_when_trip_start[' Longitude']
-            trip_start_location_alt = row_when_trip_start[' Altitude']
+            # warming_duration = row_when_trip_start['Run time since engine start(s)']
+            col = 'Run time since engine start(s)'
+            warming_duration = df_warming[df_warming[col].notnull()][col].iloc[-1] - df_warming[df_warming[col].notnull()][col].iloc[0]
+            # ToDo: расчет времени прогрева сделать на основе разницы глобального таймера/часов
+            #  (бывает что таймер не с нуля начинается - как в trackLog-2020-нояб.-21_12-48-18.csv)
         except KeyError:
             pass
 
         try:
-            trip_start_fuel_level = row_when_trip_start['Fuel Level (From Engine ECU)(%)']
+            # warming_finish_engine_temperature = row_when_trip_start['Engine Coolant Temperature(°C)']
+            col = 'Engine Coolant Temperature(°C)'
+            warming_finish_engine_temperature = df_warming[df_warming[col].notnull()][col].iloc[-1]
+        except KeyError:
+            pass
+
+    # поездка состоялась?
+    if not df_trip.empty:
+        try:
+            # trip_start_time = row_when_trip_start[' Device Time']
+            col = ' Device Time'
+            trip_start_time = df_trip[df_trip[col].notnull()][col].iloc[0]
+            trip_finish_time = df_trip[df_trip[col].notnull()][col].iloc[-1]
         except KeyError:
             pass
 
         try:
-            trip_start_ambient_temperature = row_when_trip_start['Ambient air temp(°C)']
+            col = ' Latitude'
+            trip_start_location_lat = df_trip[df_trip[col].notnull()][col].iloc[0]
+            trip_finish_location_lat = df_trip[df_trip[col].notnull()][col].iloc[-1]
+
+            col = ' Longitude'
+            trip_start_location_long = df_trip[df_trip[col].notnull()][col].iloc[0]
+            trip_finish_location_long = df_trip[df_trip[col].notnull()][col].iloc[-1]
+
+            col = ' Altitude'
+            trip_start_location_alt = df_trip[df_trip[col].notnull()][col].iloc[0]
+            trip_finish_location_alt = df_trip[df_trip[col].notnull()][col].iloc[-1]
         except KeyError:
             pass
 
         try:
-            warming_fuel_used = row_when_trip_start['Fuel used (trip)(l)']
+            # trip_start_fuel_level = row_when_trip_start['Fuel Level (From Engine ECU)(%)']
+            col = 'Fuel Level (From Engine ECU)(%)'
+            trip_start_fuel_level = df_trip[df_trip[col].notnull()][col].iloc[0]
         except KeyError:
             pass
 
         try:
-            warming_duration = row_when_trip_start['Run time since engine start(s)']
+            # trip_start_ambient_temperature = df_trip[df_trip['Ambient air temp(°C)'].notnull()]['Ambient air temp(°C)'].iloc[0]
+            col = 'Ambient air temp(°C)'
+            trip_start_ambient_temperature = df_trip[df_trip[col].notnull()][col].iloc[0]
+            trip_finish_ambient_temperature = df_trip[df_trip[col].notnull()][col].iloc[-1]
         except KeyError:
             pass
 
         try:
-            warming_finish_engine_temperature = row_when_trip_start['Engine Coolant Temperature(°C)']
-        except KeyError:
-            pass
-
-    # данные в конце поездки
-    if 1:
-        row_when_trip_finish = df[df['Speed (OBD)(km/h)'] > 0].iloc[-1]
-
-        try:
-            trip_finish_time = row_when_trip_finish[' Device Time']
+            # trip_distance = (row_when_trip_finish['Trip Distance(km)'])
+            col = 'Trip Distance(km)'
+            trip_distance = df_trip[df_trip[col].notnull()][col].iloc[-1]
         except KeyError:
             pass
 
         try:
-            # trip_finish_pos = (row_when_trip_finish[' Latitude'], row_when_trip_finish[' Longitude'], row_when_trip_finish[' Altitude'])
-            trip_finish_location_lat = row_when_trip_finish[' Latitude']
-            trip_finish_location_long = row_when_trip_finish[' Longitude']
-            trip_finish_location_alt = row_when_trip_finish[' Altitude']
+            # trip_duration = (row_when_trip_finish['Trip Time(Since journey start)(s)'])
+            col = 'Trip Time(Since journey start)(s)'
+            trip_duration = df_trip[df_trip[col].notnull()][col].iloc[-1]
         except KeyError:
             pass
 
         try:
-            trip_distance = (row_when_trip_finish['Trip Distance(km)'])
+            # trip_percentage_idle_driving = (row_when_trip_finish['Percentage of Idle driving(%)'])
+            col = 'Percentage of Idle driving(%)'
+            trip_percentage_idle_driving = df_trip[df_trip[col].notnull()][col].iloc[-1]
+
+            col = 'Percentage of Highway driving(%)'
+            trip_percentage_highway_driving = df_trip[df_trip[col].notnull()][col].iloc[-1]
+
+            col = 'Percentage of City driving(%)'
+            trip_percentage_city_driving = df_trip[df_trip[col].notnull()][col].iloc[-1]
         except KeyError:
             pass
 
         try:
-            trip_duration = (row_when_trip_finish['Trip Time(Since journey start)(s)'])
+            # trip_fuel_consumption = (row_when_trip_finish['Trip average Litres/100 KM(l/100km)'])
+            col = 'Trip average Litres/100 KM(l/100km)'
+            trip_fuel_consumption = df_trip[df_trip[col].notnull()][col].iloc[-1]
         except KeyError:
             pass
 
         try:
-            trip_percentage_idle_driving = (row_when_trip_finish['Percentage of Idle driving(%)'])
+            # trip_fuel_used = (row_when_trip_finish['Fuel used (trip)(l)'])
+            col = 'Fuel used (trip)(l)'
+            trip_fuel_used = df_trip[df_trip[col].notnull()][col].iloc[-1]
         except KeyError:
             pass
 
         try:
-            trip_fuel_consumption = (row_when_trip_finish['Trip average Litres/100 KM(l/100km)'])
+            # trip_average_speed = (row_when_trip_finish['Average trip speed(whilst stopped or moving)(km/h)'])
+            col = 'Average trip speed(whilst stopped or moving)(km/h)'
+            trip_average_speed = df_trip[df_trip[col].notnull()][col].iloc[-1]
         except KeyError:
             pass
 
         try:
-            trip_fuel_used = (row_when_trip_finish['Fuel used (trip)(l)'])
+            # trip_finish_fuel_level = (row_when_trip_finish['Fuel Level (From Engine ECU)(%)'])
+            col = 'Fuel Level (From Engine ECU)(%)'
+            trip_finish_fuel_level = df_trip[df_trip[col].notnull()][col].iloc[-1]
         except KeyError:
             pass
 
-        try:
-            trip_average_speed = (row_when_trip_finish['Average trip speed(whilst stopped or moving)(km/h)'])
-        except KeyError:
-            pass
-
-        try:
-            trip_finish_fuel_level = (row_when_trip_finish['Fuel Level (From Engine ECU)(%)'])
-        except KeyError:
-            pass
-
-        try:
-            trip_finish_ambient_temperature = (row_when_trip_finish['Ambient air temp(°C)'])
-        except KeyError:
-            pass
-
-        try:
-            pass
-            # fuel_capacity = 100*trip_fuel_used/(trip_start_fuel_level - trip_finish_fuel_level)
-        except KeyError:
-            pass
-        except Exception:
-            pass
+        if (type(trip_fuel_used) != str) and (trip_start_fuel_level - trip_finish_fuel_level) > 0:
+            fuel_capacity = 100*trip_fuel_used/(trip_start_fuel_level - trip_finish_fuel_level)
+        else:
+            fuel_capacity = 0.0
 
     # упакуем значения возвращаемых переменных
     for var_name, description in ret_var_names.items():
-        ret[description] = locals()[var_name]
+        try:
+            ret[description] = locals()[var_name]
+        except:
+            ret[description] = 'none'
 
     return ret
 
@@ -318,15 +402,19 @@ if __name__ == '__main__':
     locale.setlocale(locale.LC_TIME, loc)
     print(out)
 
-    files_template = r'C:\Users\likhobabin.OPTEN\Downloads\torqueLogs-20210315T123425Z-001\torqueLogs\*.csv'
-    for num, file_path in enumerate(glob.glob(files_template)):
+    files_template = r'C:\Users\AcerSTE\PycharmProjects\TorqueLogReader\torqueLogs\nan\*.csv'
+    b_print_header = True
+    for file_path in glob.glob(files_template):
         file_name = os.path.split(file_path)[1]
 
         try:
             file_summary = read_one_file(file_path)
-        except:
-            pass
+        except Exception as e:
+            print(file_name, e)
         else:
-            if num == 0:
+            if b_print_header:
+                print('File name', end='\t')
                 print('\t'.join(list(file_summary.keys())))
+                b_print_header = False
+            print(file_name, end='\t')
             print('\t'.join(map(str, list(file_summary.values()))))
