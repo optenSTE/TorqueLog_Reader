@@ -311,11 +311,9 @@ def read_one_file(file_name):
             pass
 
         try:
-            # warming_duration = row_when_trip_start['Run time since engine start(s)']
-            col = 'Run time since engine start(s)'
-            warming_duration = df_warming[df_warming[col].notnull()][col].iloc[-1] - df_warming[df_warming[col].notnull()][col].iloc[0]
-            # ToDo: расчет времени прогрева сделать на основе разницы глобального таймера/часов
-            #  (бывает что таймер не с нуля начинается - как в trackLog-2020-нояб.-21_12-48-18.csv)
+            # col = 'Run time since engine start(s)'
+            # warming_duration = df_warming[df_warming[col].notnull()][col].iloc[-1] - df_warming[df_warming[col].notnull()][col].iloc[0]
+            warming_duration = (df_warming.index[-1] - df_warming.index[0]).total_seconds()
         except:
             pass
 
@@ -380,8 +378,9 @@ def read_one_file(file_name):
 
         try:
             # trip_duration = (row_when_trip_finish['Trip Time(Since journey start)(s)'])
-            col = 'Trip Time(Since journey start)(s)'
-            trip_duration = df_trip[df_trip[col].notnull()][col].iloc[-1]
+            # col = 'Trip Time(Since journey start)(s)'
+            # trip_duration = df_trip[df_trip[col].notnull()][col].iloc[-1]
+            trip_duration = (df_trip.index[-1] - df_trip.index[0]).total_seconds()
         except:
             pass
 
